@@ -97,8 +97,11 @@ async def recalculate_done_ratio(issue_id: str, user_id: int):
         
         for cl in root.findall("checklist"):
             subj = (cl.findtext("subject") or "").strip().lower()
-            # Пропускаем заголовки
-            if "проверка оборудования" in subj or "комплектация оборудования" in subj or "выдача готового" in subj:
+            # Пропускаем заголовки (все варианты!)
+            if ("проверка оборудования" in subj or 
+                "комплектация оборудования" in subj or 
+                "выдача готового" in subj or
+                "переместить изделие в изолятор брака" in subj):
                 continue
             
             total += 1
@@ -515,6 +518,185 @@ async def find_control_task(serial: str, user_id: int) -> Optional[dict]:
             logging.error(f"Ошибка find_control_task: {e}")
             return None
 
+# Функция поиска и скачивания ТЗ
+
+async def find_and_get_tz_file(issue_id: str, user_id: int) -> Optional[dict]:
+    """
+    Ищет файл ТЗ*.xlsx в задаче контроля, если не находит — ищет в родительской задаче.
+    Возвращает: {"filename": "ТЗ_123.xlsx", "file_url": "https://..."} или None
+    """
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    
+    async def search_tz_in_issue(task_id: str) -> Optional[dict]:
+        """Ищет ТЗ*.xlsx в конкретной задаче"""
+        url = f"{REDMINE_URL}/issues/{task_id}.json?include=attachments"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, ssl=False) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            
+            attachments = data.get("issue", {}).get("attachments", [])
+            
+            # Ищем файл по маске ТЗ*.xlsx
+            for att in attachments:
+                filename = att.get("filename", "").strip()
+                if filename.upper().startswith("ТЗ") and filename.lower().endswith(".xlsx"):
+                    file_url = att.get("content_url", "")
+                    if not file_url.startswith("http"):
+                        file_url = f"{REDMINE_URL}{file_url}"
+                    
+                    logging.info(f"Найден файл ТЗ: {filename} в задаче #{task_id}")
+                    return {
+                        "filename": filename,
+                        "file_url": file_url,
+                        "id": att.get("id")
+                    }
+            
+            return None
+        
+        except Exception as e:
+            logging.error(f"Ошибка поиска ТЗ в задаче #{task_id}: {e}")
+            return None
+    
+    try:
+        # 1) Ищем в задаче контроля
+        tz_file = await search_tz_in_issue(issue_id)
+        if tz_file:
+            return tz_file
+        
+        # 2) Если не нашли — ищем в родительской задаче
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{REDMINE_URL}/issues/{issue_id}.json", headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+        
+        parent = data.get("issue", {}).get("parent")
+        if parent:
+            parent_id = str(parent.get("id"))
+            logging.info(f"Задача контроля #{issue_id} имеет родителя #{parent_id}, ищу ТЗ там")
+            tz_file = await search_tz_in_issue(parent_id)
+            if tz_file:
+                return tz_file
+        
+        logging.warning(f"Файл ТЗ не найден ни в задаче #{issue_id}, ни в родительской")
+        return None
+    
+    except Exception as e:
+        logging.error(f"Ошибка find_and_get_tz_file: {e}")
+        return None
+
+async def download_tz_file(file_url: str, filename: str, user_id: int) -> Optional[bytes]:
+    """Скачивает файл ТЗ из Redmine"""
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    logging.error(f"Ошибка скачивания ТЗ: HTTP {resp.status}")
+                    return None
+                
+                file_data = await resp.read()
+                logging.info(f"Файл {filename} успешно скачан ({len(file_data)} байт)")
+                return file_data
+    
+    except Exception as e:
+        logging.error(f"Ошибка скачивания файла ТЗ: {e}")
+        return None
+
+async def get_checklist_for_serial(issue_id: str, serial: str, user_id: int) -> Optional[str]:
+    """
+    Возвращает отформатированный чек-лист для конкретного серийника.
+    Если все пункты отмечены → возвращает "✅ Данное оборудование прошло ОТК!"
+    Если серийник не найден → возвращает None
+    """
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    return None
+                xml_text = await resp.text()
+        
+        root = ET.fromstring(xml_text)
+        checklist_items = []
+        
+        for cl in root.findall("checklist"):
+            checklist_items.append({
+                "subject": (cl.findtext("subject") or "").strip(),
+                "is_done": cl.findtext("is_done") or "0",
+            })
+        
+        # Найти блок серийника
+        serial_idx = None
+        for idx, item in enumerate(checklist_items):
+            subj = item["subject"]
+            if ("проверка оборудования" in subj.lower() and 
+                serial.upper() in subj.upper() and 
+                "указать" not in subj.lower()):
+                serial_idx = idx
+                break
+        
+        if serial_idx is None:
+            # Серийник не найден в чек-листе
+            return None
+        
+        # Найти конец блока
+        block_end_idx = len(checklist_items) - 1
+        for idx in range(serial_idx + 1, len(checklist_items)):
+            subj_l = checklist_items[idx]["subject"].lower()
+            if "проверка оборудования" in subj_l:
+                block_end_idx = idx - 1
+                break
+        
+        # Собираем пункты блока (без заголовков)
+        checklist_lines = []
+        all_checked = True
+        
+        for idx in range(serial_idx + 1, block_end_idx + 1):
+            item = checklist_items[idx]
+            subj = item["subject"]
+            subj_l = subj.lower()
+            is_done = item["is_done"] in ("1", "true")
+            
+            # Пропускаем заголовки
+            if ("проверка оборудования" in subj_l or 
+                "комплектация оборудования" in subj_l or 
+                "выдача готового" in subj_l or
+                "переместить изделие в изолятор брака" in subj_l):
+                continue
+            
+            # Сокращаем название (убираем "+прикрепить фото...+")
+            import re
+            short_name = re.sub(r'\s*\+[^+]+\+\s*', '', subj).strip()
+            
+            # Добавляем в список
+            icon = "✅" if is_done else "❌"
+            checklist_lines.append(f"{icon} {short_name}")
+            
+            if not is_done:
+                all_checked = False
+        
+        # Если все отмечены → специальное сообщение
+        if all_checked:
+            return "✅ Данное оборудование прошло ОТК!"
+        
+        # Иначе → список пунктов
+        if not checklist_lines:
+            return None
+        
+        return "📋 Чек-лист для данного оборудования:\n\n" + "\n".join(checklist_lines)
+    
+    except Exception as e:
+        logging.error(f"Ошибка get_checklist_for_serial: {e}")
+        return None
+
 # ===================== FSM для загрузки фото =====================
 
 class UploadPhoto(StatesGroup):
@@ -578,6 +760,11 @@ async def handle_photo(message: types.Message, state: FSMContext):
         if "CETOE2300" in serial.upper() or "CETOE2600" in serial.upper():
             text += "\n⚠️ Напоминание: необходимо наклеить транспортировочные пломбы!"
         
+        # === НОВАЯ ЛОГИКА: ПОЛУЧАЕМ ЧЕК-ЛИСТ ===
+        checklist_text = await get_checklist_for_serial(control_task["id"], serial, message.from_user.id)
+        if checklist_text:
+            text += f"\n\n{checklist_text}"
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text=control_task["id"], url=control_task["url"]),
@@ -586,6 +773,33 @@ async def handle_photo(message: types.Message, state: FSMContext):
         ])
         
         await message.answer(text, reply_markup=keyboard)
+        
+        # === ПОИСК И ОТПРАВКА ТЗ ===
+        tz_status_msg = await message.answer("⏳ Ищу файл ТЗ...")
+        
+        tz_file = await find_and_get_tz_file(control_task["id"], message.from_user.id)
+        
+        if tz_file:
+            # Скачиваем файл
+            file_data = await download_tz_file(tz_file["file_url"], tz_file["filename"], message.from_user.id)
+            
+            if file_data:
+                await tz_status_msg.delete()
+                
+                # Отправляем файл пользователю
+                from aiogram.types import BufferedInputFile
+                
+                document = BufferedInputFile(file_data, filename=tz_file["filename"])
+                await message.answer_document(
+                    document=document,
+                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                )
+                logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
+            else:
+                await tz_status_msg.edit_text("⚠️ Не удалось скачать файл ТЗ")
+        else:
+            await tz_status_msg.edit_text("📄 ТЗ не найдено")
+        await state.clear()
         return
 
     # === СЦЕНАРИЙ 1.5: Фото + "Х" (русская) → последнее фото для оборудования ===
@@ -702,6 +916,31 @@ async def handle_image_document(message: types.Message, state: FSMContext):
         ])
         
         await message.answer(text, reply_markup=keyboard)
+        
+        # === НОВАЯ ЛОГИКА: ПОИСК И ОТПРАВКА ТЗ ===
+        tz_status_msg = await message.answer("⏳ Ищу файл ТЗ...")
+        
+        tz_file = await find_and_get_tz_file(control_task["id"], message.from_user.id)
+        
+        if tz_file:
+            file_data = await download_tz_file(tz_file["file_url"], tz_file["filename"], message.from_user.id)
+            
+            if file_data:
+                await tz_status_msg.delete()
+                
+                from aiogram.types import BufferedInputFile
+                
+                document = BufferedInputFile(file_data, filename=tz_file["filename"])
+                await message.answer_document(
+                    document=document,
+                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                )
+                logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
+            else:
+                await tz_status_msg.edit_text("⚠️ Не удалось скачать файл ТЗ")
+        else:
+            await tz_status_msg.edit_text("📄 ТЗ не найдено")
+        
         return
 
     # === СЦЕНАРИЙ 1.5: Документ + "Х" ===
@@ -817,6 +1056,11 @@ async def process_issue_number(message: types.Message, state: FSMContext):
         if "CETOE2300" in serial.upper() or "CETOE2600" in serial.upper():
             text += "\n⚠️ Напоминание: необходимо наклеить транспортировочные пломбы!"
         
+        # === НОВАЯ ЛОГИКА: ПОЛУЧАЕМ ЧЕК-ЛИСТ ===
+        checklist_text = await get_checklist_for_serial(control_task["id"], serial, message.from_user.id)
+        if checklist_text:
+            text += f"\n\n{checklist_text}"
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text=control_task["id"], url=control_task["url"]),
@@ -825,6 +1069,31 @@ async def process_issue_number(message: types.Message, state: FSMContext):
         ])
         
         await message.answer(text, reply_markup=keyboard)
+        
+        # === ПОИСК И ОТПРАВКА ТЗ ===
+        tz_status_msg = await message.answer("⏳ Ищу файл ТЗ...")
+        
+        tz_file = await find_and_get_tz_file(control_task["id"], message.from_user.id)
+        
+        if tz_file:
+            file_data = await download_tz_file(tz_file["file_url"], tz_file["filename"], message.from_user.id)
+            
+            if file_data:
+                await tz_status_msg.delete()
+                
+                from aiogram.types import BufferedInputFile
+                
+                document = BufferedInputFile(file_data, filename=tz_file["filename"])
+                await message.answer_document(
+                    document=document,
+                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                )
+                logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
+            else:
+                await tz_status_msg.edit_text("⚠️ Не удалось скачать файл ТЗ")
+        else:
+            await tz_status_msg.edit_text("📄 ТЗ не найдено")
+        await state.clear()
         return
     
     # Если ввели "Х" → запускаем поиск для последнего фото
@@ -1260,7 +1529,10 @@ async def mark_remaining_checklist_items(issue_id: str, serial: str, user_id: in
                 subj_l = item["subject"].lower()
                 
                 # Пропустить заголовки
-                if "проверка оборудования" in subj_l or "комплектация оборудования" in subj_l or "выдача готового" in subj_l:
+                if ("проверка оборудования" in subj_l or 
+                    "комплектация оборудования" in subj_l or 
+                    "выдача готового" in subj_l or
+                    "переместить изделие в изолятор брака" in subj_l):
                     continue
                 
                 # Пропустить уже отмеченные
@@ -1328,12 +1600,16 @@ async def check_all_checklists_complete(issue_id: str, user_id: int) -> bool:
             subj = (cl.findtext("subject") or "").strip().lower()
             is_done = cl.findtext("is_done") or "0"
             
-            # Пропустить заголовки
-            if "проверка оборудования" in subj or "комплектация оборудования" in subj or "выдача готового" in subj:
+            # Пропустить заголовки (все возможные варианты!)
+            if ("проверка оборудования" in subj or 
+                "комплектация оборудования" in subj or 
+                "выдача готового" in subj or
+                "переместить изделие в изолятор брака" in subj):
                 continue
             
             # Если хоть один пункт не отмечен → False
             if is_done not in ("1", "true"):
+                logging.info(f"[DEBUG] Неотмеченный пункт: '{cl.findtext('subject')}'")
                 return False
         
         return True
@@ -1960,8 +2236,9 @@ async def confirm_final_photo_callback(callback: CallbackQuery, state: FSMContex
         
         # 6) Проверить все ли чек-листы отмечены
         all_complete = await check_all_checklists_complete(control_task_id, user_id)
+        logging.info(f"Все чек-листы заполнены: {all_complete}")
         
-        # 7) Если все отмечены → обновить поля + сменить статус
+        # 7) Если все отмечены → обновить поля + сменить статус + 🎉 САЛЮТ
         if all_complete:
             from config import STATUS_DONE
             headers_json = {
@@ -1991,6 +2268,8 @@ async def confirm_final_photo_callback(callback: CallbackQuery, state: FSMContex
                         if custom_fields_to_update:
                             payload["issue"]["custom_fields"] = custom_fields_to_update
                         
+                        logging.info(f"Отправляем PUT запрос для завершения задачи: {payload}")
+                        
                         async with session.put(
                             f"{REDMINE_URL}/issues/{control_task_id}.json",
                             headers=headers_json,
@@ -1999,6 +2278,11 @@ async def confirm_final_photo_callback(callback: CallbackQuery, state: FSMContex
                         ) as resp:
                             if resp.status in (200, 204):
                                 logging.info(f"Задача #{control_task_id} переведена в статус 'Выполнено'")
+                                # 🎉 САЛЮТ!
+                                await bot.send_message(callback.from_user.id, "🎉 Задача контроля выполнена!")
+                            else:
+                                response_text = await resp.text()
+                                logging.error(f"Ошибка смены статуса: HTTP {resp.status}, {response_text}")
         
         # 8) Пересчитываем процент готовности
         await recalculate_done_ratio(control_task_id, user_id)
@@ -2008,16 +2292,11 @@ async def confirm_final_photo_callback(callback: CallbackQuery, state: FSMContex
             [InlineKeyboardButton(text=control_task_id, url=f"{REDMINE_URL}/issues/{control_task_id}")]
         ]))
         
-        # 10) Сообщение о завершении
-        if all_complete:
-            await bot.send_message(callback.from_user.id, f"🎉 Задача контроля выполнена!")
-        
         await state.clear()
     
     except Exception as e:
         logging.error(f"Ошибка confirm_final: {e}", exc_info=True)
         await bot.send_message(callback.from_user.id, f"❌ Ошибка: {e}")
-
 
 # ===================== УДАЛЕНИЕ ВЛОЖЕНИЯ =====================
 
@@ -2269,8 +2548,7 @@ async def confirm_delete(callback: CallbackQuery):
         logging.error(f"Исключение при удалении фото: {e}", exc_info=True)
         await callback.message.edit_text(f"⚠️ Ошибка при удалении фото:\n{e}")
 
-
-# ===================== КОМАНДА /c — ЧЕК-ЛИСТ =====================
+# ===================== КОМАНДА /c — УДАЛЕНИЕ ЧЕК-ЛИСТА =====================
 
 @dp.message(Command("c"))
 async def checklist_command(message: types.Message):
@@ -2283,64 +2561,120 @@ async def checklist_command(message: types.Message):
     headers = {"X-Redmine-API-Key": get_user_api_token(message.from_user.id)}
 
     url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, ssl=False) as resp:
-            if resp.status != 200:
-                await message.answer(f"Не удалось получить чек-лист задачи #{issue_id}: HTTP {resp.status}")
-                return
-            xml_text = await resp.text()
-
+    
     try:
-        root = ET.fromstring(xml_text)
+        async with aiohttp.ClientSession() as session:
+            # Получаем чек-лист
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    await message.answer(f"Не удалось получить чек-лист задачи #{issue_id}: HTTP {resp.status}")
+                    return
+                xml_text = await resp.text()
+
+            root = ET.fromstring(xml_text)
+            checklist_ids = []
+            
+            # Собираем ID всех пунктов чек-листа
+            for cl in root.findall("checklist"):
+                cid = cl.findtext("id")
+                if cid:
+                    checklist_ids.append(cid)
+            
+            if not checklist_ids:
+                await message.answer(f"В задаче #{issue_id} чек-лист пуст.")
+                return
+            
+            # Подтверждение удаления
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text=f"УДАЛИТЬ {len(checklist_ids)} пунктов чек-листа!", 
+                        callback_data=f"delete_checklist:{issue_id}:{message.from_user.id}"
+                    )]
+                ]
+            )
+            
+            await message.answer(
+                f"⚠️ Вы уверены? Будет удалено {len(checklist_ids)} пунктов чек-листа из задачи #{issue_id}",
+                reply_markup=keyboard
+            )
+    
     except Exception as e:
-        await message.answer(f"Ошибка парсинга XML чек-листа: {e}")
+        logging.error(f"Ошибка получения чек-листа: {e}")
+        await message.answer(f"Ошибка при получении чек-листа: {e}")
+
+
+@dp.callback_query(lambda c: c.data.startswith("delete_checklist:"))
+async def confirm_delete_checklist(callback: CallbackQuery):
+    """Подтверждение удаления чек-листа."""
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Ошибка: неверный формат данных", show_alert=True)
         return
-
-    items = []
-    target_ids = []
-    for cl in root.findall("checklist"):
-        cid = cl.findtext("id")
-        subj = cl.findtext("subject") or ""
-        done = cl.findtext("is_done") or "0"
-        position = cl.findtext("position") or "0"
-        issueid_inner = cl.findtext("issue_id") or issue_id
-        checked = done in ("true", "1")
-        items.append(f"[{'✔' if checked else '✖'}] {subj} (id={cid})")
-        if subj.strip() == "Упаковка оборудования":
-            target_ids.append({"id": cid, "subject": subj, "position": position, "issue_id": issueid_inner})
-
-    if not items:
-        await message.answer(f"В задаче #{issue_id} чек-лист пуст.")
-    else:
-        await message.answer("Чек-лист:\n" + "\n".join(items))
-
-    if not target_ids:
-        await message.answer("Пункт «Упаковка оборудования» не найден в чек-листе.")
+    
+    issue_id = parts[1]
+    user_id = int(parts[2])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
         return
-
-    async with aiohttp.ClientSession() as session:
-        for t in target_ids:
-            cid = t["id"]
-            checklist_el = ET.Element("checklist")
-            ET.SubElement(checklist_el, "id").text = str(cid)
-            ET.SubElement(checklist_el, "issue_id").text = str(t.get("issue_id", issue_id))
-            ET.SubElement(checklist_el, "subject").text = t.get("subject", "Упаковка оборудования")
-            ET.SubElement(checklist_el, "is_done").text = "1"
-            ET.SubElement(checklist_el, "position").text = str(t.get("position", "0"))
-
-            payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
-            update_url = f"{REDMINE_URL}/checklists/{cid}.xml"
-
-            try:
-                async with session.put(update_url, headers={**headers, "Content-Type": "application/xml"},
-                                       data=payload, ssl=False) as resp2:
-                    if resp2.status in (200, 201, 422):
-                        await message.answer(f"✓ Поставлена галочка: «Упаковка оборудования» (id={cid}) в задаче #{issue_id}")
+    
+    await callback.answer("⏳ Удаляю чек-лист...")
+    
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Получаем чек-лист заново
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    await callback.message.edit_text(f"❌ Ошибка получения чек-листа: HTTP {resp.status}")
+                    return
+                xml_text = await resp.text()
+            
+            root = ET.fromstring(xml_text)
+            checklist_ids = []
+            
+            for cl in root.findall("checklist"):
+                cid = cl.findtext("id")
+                if cid:
+                    checklist_ids.append(cid)
+            
+            if not checklist_ids:
+                await callback.message.edit_text(f"Чек-лист в задаче #{issue_id} уже пуст.")
+                return
+            
+            # Удаляем все пункты
+            deleted_count = 0
+            failed_count = 0
+            
+            for cid in checklist_ids:
+                delete_url = f"{REDMINE_URL}/checklists/{cid}.xml"
+                async with session.delete(delete_url, headers=headers, ssl=False) as resp:
+                    if resp.status in (200, 204):
+                        deleted_count += 1
+                        logging.info(f"Удалён пункт чек-листа ID={cid} из задачи #{issue_id}")
                     else:
-                        await message.answer(f"Ошибка при отметке пункта id={cid}: HTTP {resp2.status}")
-            except Exception as e:
-                await message.answer(f"Ошибка при запросе к {update_url}: {e}")
-
+                        failed_count += 1
+                        logging.error(f"Не удалось удалить пункт ID={cid}: HTTP {resp.status}")
+            
+            # Пересчитываем процент готовности
+            await recalculate_done_ratio(issue_id, user_id)
+            
+            # Результат
+            result_text = f"✅ Чек-лист задачи #{issue_id} удалён!\n\n"
+            result_text += f"Удалено пунктов: {deleted_count}"
+            
+            if failed_count > 0:
+                result_text += f"\n⚠️ Не удалось удалить: {failed_count}"
+            
+            await callback.message.edit_text(result_text)
+            logging.info(f"Чек-лист задачи #{issue_id} удалён пользователем {user_id}")
+    
+    except Exception as e:
+        logging.error(f"Ошибка удаления чек-листа: {e}", exc_info=True)
+        await callback.message.edit_text(f"❌ Ошибка при удалении чек-листа: {e}")
 
 # ===================== ЗАПУСК БОТА =====================
 
