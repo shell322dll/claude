@@ -799,7 +799,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
                 await tz_status_msg.edit_text("⚠️ Не удалось скачать файл ТЗ")
         else:
             await tz_status_msg.edit_text("📄 ТЗ не найдено")
-        await state.clear()
+
         return
 
     # === СЦЕНАРИЙ 1.5: Фото + "Х" (русская) → последнее фото для оборудования ===
@@ -1093,7 +1093,7 @@ async def process_issue_number(message: types.Message, state: FSMContext):
                 await tz_status_msg.edit_text("⚠️ Не удалось скачать файл ТЗ")
         else:
             await tz_status_msg.edit_text("📄 ТЗ не найдено")
-        await state.clear()
+
         return
     
     # Если ввели "Х" → запускаем поиск для последнего фото
@@ -1292,7 +1292,7 @@ async def update_checklist_first_step(issue_id: str, serial: str, start_idx: int
             ET.SubElement(checklist_el, "id").text = str(item["id"])
             ET.SubElement(checklist_el, "issue_id").text = str(item["issue_id"])
             ET.SubElement(checklist_el, "subject").text = f"Проверка оборудования {serial}"
-            ET.SubElement(checklist_el, "position").text = str(item["position"])
+            #ET.SubElement(checklist_el, "position").text = str(item["position"])
             
             payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
             async with session.put(f"{REDMINE_URL}/checklists/{item['id']}.xml", headers={**headers, "Content-Type": "application/xml"}, data=payload, ssl=False):
@@ -1307,7 +1307,7 @@ async def update_checklist_first_step(issue_id: str, serial: str, start_idx: int
                     ET.SubElement(checklist_el, "issue_id").text = str(next_item["issue_id"])
                     ET.SubElement(checklist_el, "subject").text = next_item["subject"]
                     ET.SubElement(checklist_el, "is_done").text = "1"
-                    ET.SubElement(checklist_el, "position").text = str(next_item["position"])
+                    #ET.SubElement(checklist_el, "position").text = str(next_item["position"])
                     
                     payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
                     async with session.put(f"{REDMINE_URL}/checklists/{next_item['id']}.xml", headers={**headers, "Content-Type": "application/xml"}, data=payload, ssl=False):
@@ -1555,7 +1555,7 @@ async def mark_remaining_checklist_items(issue_id: str, serial: str, user_id: in
                 ET.SubElement(checklist_el, "issue_id").text = str(item["issue_id"])
                 ET.SubElement(checklist_el, "subject").text = item["subject"]
                 ET.SubElement(checklist_el, "is_done").text = "1"
-                ET.SubElement(checklist_el, "position").text = str(item["position"])
+                #ET.SubElement(checklist_el, "position").text = str(item["position"])
                 
                 payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
                 update_url = f"{REDMINE_URL}/checklists/{item['id']}.xml"
@@ -1879,7 +1879,7 @@ async def mark_items_up_to_target(issue_id: str, serial: str, target_keyword: st
                 ET.SubElement(checklist_el, "issue_id").text = str(item["issue_id"])
                 ET.SubElement(checklist_el, "subject").text = item["subject"]
                 ET.SubElement(checklist_el, "is_done").text = "1"
-                ET.SubElement(checklist_el, "position").text = str(item["position"])
+                #ET.SubElement(checklist_el, "position").text = str(item["position"])
                 
                 payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
                 update_url = f"{REDMINE_URL}/checklists/{item['id']}.xml"
