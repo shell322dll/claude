@@ -522,13 +522,13 @@ async def find_control_task(serial: str, user_id: int) -> Optional[dict]:
 
 async def find_and_get_tz_file(issue_id: str, user_id: int) -> Optional[dict]:
     """
-    Ищет файл ТЗ*.xlsx в задаче контроля, если не находит — ищет в родительской задаче.
+    Ищет самый свежий файл ТЗ*.xlsx в задаче контроля, если не находит — ищет в родительской задаче.
     Возвращает: {"filename": "ТЗ_123.xlsx", "file_url": "https://..."} или None
     """
     headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
     
     async def search_tz_in_issue(task_id: str) -> Optional[dict]:
-        """Ищет ТЗ*.xlsx в конкретной задаче"""
+        """Ищет самый свежий ТЗ*.xlsx в конкретной задаче"""
         url = f"{REDMINE_URL}/issues/{task_id}.json?include=attachments"
         
         try:
@@ -540,7 +540,8 @@ async def find_and_get_tz_file(issue_id: str, user_id: int) -> Optional[dict]:
             
             attachments = data.get("issue", {}).get("attachments", [])
             
-            # Ищем файл по маске ТЗ*.xlsx
+            # Собираем все файлы ТЗ
+            tz_files = []
             for att in attachments:
                 filename = att.get("filename", "").strip()
                 if filename.upper().startswith("ТЗ") and filename.lower().endswith(".xlsx"):
@@ -548,12 +549,19 @@ async def find_and_get_tz_file(issue_id: str, user_id: int) -> Optional[dict]:
                     if not file_url.startswith("http"):
                         file_url = f"{REDMINE_URL}{file_url}"
                     
-                    logging.info(f"Найден файл ТЗ: {filename} в задаче #{task_id}")
-                    return {
+                    tz_files.append({
                         "filename": filename,
                         "file_url": file_url,
-                        "id": att.get("id")
-                    }
+                        "id": att.get("id"),
+                        "created_on": att.get("created_on", "")  # Дата создания
+                    })
+            
+            # Если найдены файлы ТЗ - возвращаем самый свежий
+            if tz_files:
+                # Сортируем по дате создания (самый новый - последний)
+                latest_tz = max(tz_files, key=lambda x: x.get("created_on", ""))
+                logging.info(f"Найден самый свежий файл ТЗ: {latest_tz['filename']} в задаче #{task_id}")
+                return latest_tz
             
             return None
         
