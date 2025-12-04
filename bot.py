@@ -5,7 +5,9 @@ import aiohttp
 import asyncio
 import mimetypes
 import xml.etree.ElementTree as ET
+import json
 
+from pathlib import Path
 from typing import Optional, Callable, Dict, Any, Awaitable
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
@@ -13,8 +15,54 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from urllib.parse import quote
-from config import TELEGRAM_TOKEN, REDMINE_URL, REDMINE_API_TOKEN, STATUS_IN_PROGRESS, STATUS_DONE, ALLOWED_USERS, USER_CONFIGS, POZHAROV_USER_ID
+from config import (
+    TELEGRAM_TOKEN, 
+    REDMINE_URL, 
+    REDMINE_API_TOKEN, 
+    STATUS_IN_PROGRESS, 
+    STATUS_DONE, 
+    ALLOWED_USERS, 
+    USER_CONFIGS, 
+    POZHAROV_USER_ID,
+    DEFECTS_JSON_PATH,
+    # Новые константы для несоответствий:
+    FIELD_SERIAL_NUMBER,
+    FIELD_DEFECT_CODE,
+    FIELD_CATEGORY,
+    TRACKER_DEFECT_FIX,
+    STATUS_NEW,
+    PRIORITY_HIGH,
+    CHECKLIST_DEFECT_HEADER,
+    CHECKLIST_DEFECT_PHOTO,
+    CHECKLIST_DEFECT_SUBTASK,
+    CHECKLIST_DEFECT_RECHECK,
+    CHECKLIST_SUBTASK_HEADER,
+    CHECKLIST_SUBTASK_MOVE_TO_PROD,
+    CHECKLIST_SUBTASK_FIX_PREFIX,
+    CHECKLIST_SUBTASK_CHECK,
+    CHECKLIST_SUBTASK_MOVE_TO_TEST
+)
 from analyzer_service_sn import service as sn_service, AnalyzeResult
+
+# Загрузка справочника несоответствий
+DEFECTS = []
+try:
+    defects_path = Path(__file__).parent / DEFECTS_JSON_PATH
+    logging.info(f"Загрузка справочника из: {defects_path}")
+    
+    with open(defects_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+        DEFECTS = data.get("defects", [])
+    
+    logging.info(f"✅ Загружено {len(DEFECTS)} кодов несоответствий")
+    
+    # ДОБАВЬ ЭТО ДЛЯ ПРОВЕРКИ:
+    if len(DEFECTS) > 0:
+        logging.info(f"Первый дефект: {DEFECTS[0]}")
+    
+except Exception as e:
+    logging.error(f"❌ Ошибка загрузки defects.json: {e}")
+    logging.error(f"Путь: {Path(__file__).parent / DEFECTS_JSON_PATH}")
 
 # Защита от двойных нажатий
 user_processing = {}  # {user_id: timestamp}
@@ -36,6 +84,55 @@ logging.info("=" * 50)
 logging.info("Логирование настроено!")
 logging.info("=" * 50)
 
+def search_defects(query: str, limit: int = 10) -> list:
+    """
+    Ищет несоответствия по подстроке в description.
+    Возвращает список: [{"code": "001", "description": "..."}, ...]
+    """
+    query_lower = query.lower().strip()
+    
+    # ДОБАВЬ ЭТИ СТРОКИ ДЛЯ ОТЛАДКИ:
+    logging.info(f"[SEARCH] Запрос: '{query_lower}'")
+    logging.info(f"[SEARCH] Всего дефектов в базе: {len(DEFECTS)}")
+    
+    if not query_lower:
+        return []
+    
+    results = []
+    for defect in DEFECTS:
+        # ДОБАВЬ ЭТО:
+        if len(results) == 0:  # Логируем только первые попытки
+            logging.info(f"[SEARCH] Проверяю: '{defect['description'].lower()}'")
+        
+        if query_lower in defect["description"].lower():
+            results.append(defect)
+            logging.info(f"[SEARCH] Найдено совпадение: {defect['code']} - {defect['description']}")
+            if len(results) >= limit:
+                break
+    
+    logging.info(f"[SEARCH] Итого найдено: {len(results)}")
+    return results
+
+def calculate_deadline() -> str:
+    """
+    Возвращает дедлайн: +1 день, пропуск выходных.
+    Формат: "YYYY-MM-DD"
+    """
+    from datetime import datetime, timedelta
+    
+    today = datetime.now()
+    deadline = today + timedelta(days=1)
+    
+    # Если завтра суббота (weekday=5) → +3 дня (понедельник)
+    if deadline.weekday() == 5:
+        deadline = today + timedelta(days=3)
+    
+    # Если завтра воскресенье (weekday=6) → +2 дня (понедельник)
+    elif deadline.weekday() == 6:
+        deadline = today + timedelta(days=2)
+    
+    return deadline.strftime("%Y-%m-%d")
+
 def get_user_api_token(user_id: int) -> str:
     """Получает API токен пользователя по его Telegram ID"""
     user_config = USER_CONFIGS.get(user_id)
@@ -49,7 +146,7 @@ class AuthMiddleware(BaseMiddleware):
     def __init__(self, allowed_users: list):
         self.allowed_users = allowed_users
         super().__init__()
-    
+        
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
@@ -75,6 +172,251 @@ last_uploaded = {}
 
 # ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
 
+async def check_existing_defect(issue_id: str, serial: str, user_id: int) -> bool:
+    """
+    Проверяет есть ли уже зарегистрированное несоответствие для серийника.
+    Возвращает True если есть (блокируем регистрацию).
+    """
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    return False
+                xml_text = await resp.text()
+        
+        root = ET.fromstring(xml_text)
+        
+        # Ищем блок серийника
+        in_serial_block = False
+        for cl in root.findall("checklist"):
+            subj = (cl.findtext("subject") or "").strip().lower()
+            
+            # Начало блока серийника
+            if "проверка оборудования" in subj and serial.upper() in subj.upper():
+                in_serial_block = True
+                continue
+            
+            # Конец блока (новый серийник)
+            if in_serial_block and "проверка оборудования" in subj:
+                break
+            
+            # Проверяем наличие пункта "Завести подзадачу"
+            if in_serial_block and "завести подзадачу" in subj:
+                return True
+        
+        return False
+    
+    except Exception as e:
+        logging.error(f"Ошибка check_existing_defect: {e}")
+        return False
+        
+async def find_equipment_name(control_task_id: str, serial: str, user_id: int) -> dict:
+    """
+    Находит задачу производства с серийником.
+    
+    Логика поиска:
+    1. Получаем задачу контроля
+    2. Получаем её родителя
+    3. Проверяем САМОГО РОДИТЕЛЯ
+    4. Если не нашли - ищем среди siblings (подзадач родителя)
+    """
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    
+    try:
+        logging.info(f"[FIND] Ищем оборудование для S/N: {serial} в задаче контроля #{control_task_id}")
+        
+        # Получаем задачу контроля
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{control_task_id}.json",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"[FIND] Ошибка получения задачи контроля: HTTP {resp.status}")
+                    return None
+                control_data = await resp.json()
+        
+        logging.info(f"[FIND] Задача контроля получена: {control_data.get('issue', {}).get('subject', 'N/A')}")
+        
+        # Получаем родителя
+        parent = control_data.get("issue", {}).get("parent")
+        if not parent:
+            logging.error(f"[FIND] У задачи контроля нет родителя!")
+            return None
+        
+        parent_id = str(parent["id"])
+        logging.info(f"[FIND] Родительская задача: #{parent_id}")
+        
+        # ===== СНАЧАЛА ПРОВЕРЯЕМ САМОГО РОДИТЕЛЯ =====
+        
+        logging.info(f"[FIND] Проверяю родителя #{parent_id}...")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{parent_id}.json",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status == 200:
+                    parent_data = await resp.json()
+                    
+                    # Проверяем серийник у родителя
+                    result = await check_task_for_serial(parent_data, parent_id, serial, user_id)
+                    if result:
+                        return result
+                    else:
+                        logging.info(f"[FIND] Родитель не содержит S/N {serial}")
+        
+        # ===== ЕСЛИ НЕ НАШЛИ У РОДИТЕЛЯ - ИЩЕМ СРЕДИ SIBLINGS =====
+        
+        logging.info(f"[FIND] Ищу среди siblings (подзадач родителя)...")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues.json?parent_id={parent_id}&status_id=*&limit=100",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"[FIND] Ошибка получения подзадач родителя: HTTP {resp.status}")
+                    return None
+                siblings_data = await resp.json()
+        
+        siblings = siblings_data.get("issues", [])
+        logging.info(f"[FIND] Найдено подзадач родителя (siblings): {len(siblings)}")
+        
+        # Проверяем каждую подзадачу родителя
+        for idx, sibling in enumerate(siblings):
+            sibling_id = str(sibling["id"])
+            sibling_subject = sibling.get("subject", "")
+            
+            logging.info(f"[FIND] Проверяю sibling [{idx+1}/{len(siblings)}] #{sibling_id}: {sibling_subject[:60]}...")
+            
+            # Пропускаем саму задачу контроля
+            if sibling_id == control_task_id:
+                logging.info(f"[FIND] → Пропускаю (это задача контроля)")
+                continue
+            
+            # Получаем полную информацию о задаче
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{REDMINE_URL}/issues/{sibling_id}.json",
+                    headers=headers,
+                    ssl=False
+                ) as resp:
+                    if resp.status != 200:
+                        logging.warning(f"[FIND] → Ошибка получения задачи: HTTP {resp.status}")
+                        continue
+                    task_data = await resp.json()
+            
+            # Проверяем серийник
+            result = await check_task_for_serial(task_data, sibling_id, serial, user_id)
+            if result:
+                return result
+        
+        logging.error(f"[FIND] ❌ Задача производства с S/N {serial} не найдена")
+        return None
+    
+    except Exception as e:
+        logging.error(f"[FIND] Ошибка find_equipment_name: {e}", exc_info=True)
+        return None
+
+
+async def check_task_for_serial(task_data: dict, task_id: str, serial: str, user_id: int) -> dict:
+    """
+    Проверяет содержит ли задача нужный серийный номер.
+    Если да - возвращает информацию об оборудовании.
+    Если нет - возвращает None.
+    """
+    try:
+        # Проверяем поле "Серийный номер"
+        custom_fields = task_data.get("issue", {}).get("custom_fields", [])
+        serial_field = next((f for f in custom_fields if f.get("id") == FIELD_SERIAL_NUMBER), None)
+        
+        if not serial_field:
+            logging.info(f"[CHECK] → Поле 'Серийный номер' отсутствует")
+            return None
+        
+        serial_value = serial_field.get("value", "").strip()
+        logging.info(f"[CHECK] → Серийный номер: '{serial_value}'")
+        
+        # Проверяем вхождение (может быть несколько серийников через пробел)
+        if serial.upper() not in serial_value.upper():
+            logging.info(f"[CHECK] → Не совпадает")
+            return None
+        
+        logging.info(f"[CHECK] ✅ СОВПАДЕНИЕ! Нашли задачу #{task_id}")
+        
+        # Извлекаем название
+        subject = task_data["issue"]["subject"]
+        logging.info(f"[CHECK] Название задачи: {subject}")
+        
+        import re
+        match = re.search(r'\(([^()]+)\)\s*$', subject)
+        if match:
+            equipment_full = match.group(1)
+            logging.info(f"[CHECK] Извлечено (вариант без вложенных скобок): '{equipment_full}'")
+        else:
+            logging.error(f"[CHECK] Не удалось извлечь название оборудования из '{subject}'")
+            return None
+        
+        # Вариант 1: С вложенными скобками (Видеосервер RV-SE3700 (Сборка 26309) - 1 шт.)
+        match = re.search(r'\(([^(]+\([^)]+\)[^)]*)\)\s*$', subject)
+
+        if match:
+            equipment_full = match.group(1)
+            logging.info(f"[CHECK] Извлечено (вариант с вложенными скобками): '{equipment_full}'")
+        else:
+            # Вариант 2: Без вложенных скобок (Персональный компьютер для Борисова В.В. - 1 шт.)
+            match = re.search(r'\(([^()]+)\)\s*$', subject)
+            
+            if match:
+                equipment_full = match.group(1)
+                logging.info(f"[CHECK] Извлечено (вариант без вложенных скобок): '{equipment_full}'")
+            else:
+                logging.error(f"[CHECK] Не удалось извлечь название оборудования из '{subject}'")
+                return None
+        
+        equipment_full = match.group(1)
+        logging.info(f"[CHECK] Извлечено: '{equipment_full}'")
+        
+        # Заменяем количество на "- 1 шт."
+        equipment_name = re.sub(r'-\s*\d+\s*шт\.', '- 1 шт.', equipment_full)
+        logging.info(f"[CHECK] Итоговое название: '{equipment_name}'")
+        
+        # Определяем категорию
+        if serial.upper().startswith("PC"):
+            category = "Рабочая станция"
+        elif serial.upper().startswith("CE"):
+            category = "Сервер"
+        else:
+            category = "Сервер"  # По умолчанию
+        
+        logging.info(f"[CHECK] Категория: {category}")
+        
+        # Получаем assigned_to
+        assigned_to = task_data["issue"].get("assigned_to")
+        assigned_to_id = assigned_to["id"] if assigned_to else None
+        assigned_to_name = assigned_to["name"] if assigned_to else "не назначен"
+        
+        logging.info(f"[CHECK] Назначена: {assigned_to_name} (ID: {assigned_to_id})")
+        
+        return {
+            "equipment_name": equipment_name,
+            "assigned_to_id": assigned_to_id,
+            "assigned_to_name": assigned_to_name,
+            "category": category,
+            "project_id": task_data["issue"]["project"]["id"]
+        }
+    
+    except Exception as e:
+        logging.error(f"[CHECK] Ошибка check_task_for_serial: {e}", exc_info=True)
+        return None
+       
 async def recalculate_done_ratio(issue_id: str, user_id: int):
     """Пересчитывает и обновляет процент готовности задачи"""
     headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
@@ -218,6 +560,44 @@ async def ocr_sn_text_by_file_id(file_id: str) -> str:
     except Exception as e:
         logging.error(f"OCR error: {e}")
         return f"🔍 Ошибка распознавания S/N: {e}"
+        
+async def get_all_serials_from_checklist(issue_id: str, user_id: int) -> list:
+    """
+    Возвращает список ВСЕХ серийников из чек-листа задачи контроля.
+    Формат: ["ABC001", "ABC002", "ABC003", ...]
+    """
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                if resp.status != 200:
+                    return []
+                xml_text = await resp.text()
+        
+        root = ET.fromstring(xml_text)
+        serials = []
+        
+        for cl in root.findall("checklist"):
+            subj = (cl.findtext("subject") or "").strip()
+            subj_l = subj.lower()
+            
+            # Ищем заголовки "Проверка оборудования <S/N>"
+            if ("проверка оборудования" in subj_l and 
+                "указать серийный номер" not in subj_l):
+                
+                # Извлекаем серийник из названия
+                serial = subj.replace("Проверка оборудования", "").strip()
+                
+                if serial and serial not in serials:
+                    serials.append(serial)
+        
+        return serials
+    
+    except Exception as e:
+        logging.error(f"Ошибка get_all_serials_from_checklist: {e}")
+        return []
 
 # ===================== КОМАНДЫ =====================
 
@@ -227,16 +607,17 @@ async def cmd_start(message: types.Message):
         "Привет! Это бот для работы с Redmine + распознавание S/N.\n\n"
         "<b>📋 Redmine команды:</b>\n"
         "/s4 &lt;фраза&gt; — глобальный поиск задач\n"
-        "/s5 &lt;фраза&gt; — поиск задач контроль (подзадачи → родитель)\n"
-        "/d [номер] — удалить последнее фото\n"
-        "/c &lt;номер&gt; — показать чек-лист и отметить 'Упаковка'\n\n"
+        "/s5 &lt;фраза&gt; — поиск задач контроль\n"
+        "/c &lt;номер&gt; — удалить чек-лист задачи\n"
+        "/d [номер] — удалить последнее фото\n\n"
+        "<b>🚨 Регистрация несоответствий:</b>\n"
+        "Фото + подпись: <code>d номер_задачи</code>\n"
+        "Пример: отправь фото дефекта с подписью <code>d 12345</code>\n\n"
         "<b>📸 Работа с фото:</b>\n"
-        "Отправь фото с подписью:\n"
         "• <b>номер задачи</b> — прикрепить к задаче\n"
         "• <b>.</b> (точка) — найти задачу контроля по S/N\n"
-        "• <b>Х</b> (русская) — загрузить последнее фото для оборудования\n"
-        "Если забыл номер — бот переспросит.\n\n"
-        "<b>💡 Совет:</b> отправляй фото как <b>файл</b> (не сжатое) для лучшего распознавания!",
+        "• <b>Х</b> — последнее фото для оборудования\n\n"
+        "<b>💡 Совет:</b> отправляй фото как <b>файл</b> для лучшего распознавания!",
         parse_mode="HTML"
     )
 
@@ -710,8 +1091,92 @@ async def get_checklist_for_serial(issue_id: str, serial: str, user_id: int) -> 
 class UploadPhoto(StatesGroup):
     waiting_for_issue = State()
 
+# ===== НОВЫЕ СОСТОЯНИЯ ДЛЯ РЕГИСТРАЦИИ НЕСООТВЕТСТВИЙ =====
+class DefectRegistration(StatesGroup):
+    waiting_for_serial = State()      # Выбор серийника
+    waiting_for_cause = State()       # Ввод текста поиска причины
+    waiting_for_photo = State()       # Ожидание дополнительных фото
+    confirming = State()              # Финальное подтверждение
 
 # ===================== Обработка входящих изображений =====================
+
+@dp.message(lambda m: m.photo and (m.caption or "").strip().lower().startswith("d "))
+async def handle_defect_photo(message: types.Message, state: FSMContext):
+    """Фото с подписью 'd 12345' - регистрация несоответствия"""
+    caption = message.caption.strip()
+    parts = caption.split(maxsplit=1)
+    
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Формат: d <номер_задачи>")
+        return
+    
+    issue_id = parts[1]
+    photo = message.photo[-1]
+    
+    # Валидация задачи
+    headers = {"X-Redmine-API-Key": get_user_api_token(message.from_user.id)}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{issue_id}.json",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    await message.answer(f"❌ Задача #{issue_id} не найдена или нет доступа")
+                    return
+    except Exception as e:
+        await message.answer(f"❌ Ошибка проверки задачи: {e}")
+        return
+    
+    # Получаем серийники из чек-листа
+    serials = await get_all_serials_from_checklist(issue_id, message.from_user.id)
+    
+    if not serials:
+        await message.answer(f"❌ В задаче #{issue_id} нет оборудования в чек-листе")
+        return
+    
+    # Сохраняем данные
+    await state.update_data(
+        issue_id=issue_id,
+        photos=[photo.file_id],
+        defects=[]
+    )
+    await state.set_state(DefectRegistration.waiting_for_serial)
+    
+    # Показываем серийники кнопками (по 5 шт)
+    buttons = []
+    for serial in serials:
+        buttons.append([InlineKeyboardButton(
+            text=serial,
+            callback_data=f"defect_serial:{issue_id}:{serial}:{message.from_user.id}"
+        )])
+    
+    # Добавляем пагинацию если > 5
+    # (упрощённо - пока без пагинации)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons + [
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"defect_cancel:{message.from_user.id}")]
+    ])
+    
+    await message.answer(
+        f"🚨 Регистрация несоответствия\n"
+        f"Задача: #{issue_id}\n\n"
+        f"Выберите оборудование:",
+        reply_markup=keyboard
+    )
+    
+@dp.message(Command("test_defects"))
+async def test_defects_command(message: types.Message):
+    """Тестовая команда - проверка загрузки справочника"""
+    await message.answer(
+        f"📋 Загружено дефектов: {len(DEFECTS)}\n\n"
+        f"Первые 5:\n" + "\n".join([
+            f"{d['code']}: {d['description']}" 
+            for d in DEFECTS[:5]
+        ])
+    )
 
 @dp.message(lambda msg: msg.photo)
 async def handle_photo(message: types.Message, state: FSMContext):
@@ -800,7 +1265,7 @@ async def handle_photo(message: types.Message, state: FSMContext):
                 document = BufferedInputFile(file_data, filename=tz_file["filename"])
                 await message.answer_document(
                     document=document,
-                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                    #caption=f"📄 Техническое задание: {tz_file['filename']}"
                 )
                 logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
             else:
@@ -941,7 +1406,7 @@ async def handle_image_document(message: types.Message, state: FSMContext):
                 document = BufferedInputFile(file_data, filename=tz_file["filename"])
                 await message.answer_document(
                     document=document,
-                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                    #caption=f"📄 Техническое задание: {tz_file['filename']}"
                 )
                 logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
             else:
@@ -1094,7 +1559,7 @@ async def process_issue_number(message: types.Message, state: FSMContext):
                 document = BufferedInputFile(file_data, filename=tz_file["filename"])
                 await message.answer_document(
                     document=document,
-                    caption=f"📄 Техническое задание: {tz_file['filename']}"
+                    #caption=f"📄 Техническое задание: {tz_file['filename']}"
                 )
                 logging.info(f"Файл ТЗ {tz_file['filename']} отправлен пользователю {message.from_user.id}")
             else:
@@ -2683,6 +3148,702 @@ async def confirm_delete_checklist(callback: CallbackQuery):
     except Exception as e:
         logging.error(f"Ошибка удаления чек-листа: {e}", exc_info=True)
         await callback.message.edit_text(f"❌ Ошибка при удалении чек-листа: {e}")
+
+# ===== РЕГИСТРАЦИЯ НЕСООТВЕТСТВИЙ: CALLBACKS =====
+
+@dp.callback_query(lambda c: c.data.startswith("defect_cancel:"))
+async def defect_cancel_callback(callback: CallbackQuery, state: FSMContext):
+    """Отмена регистрации"""
+    user_id = int(callback.data.split(":")[1])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
+        return
+    
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer("Регистрация отменена")
+
+
+@dp.callback_query(lambda c: c.data.startswith("defect_serial:"))
+async def defect_select_serial_callback(callback: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал серийник"""
+    parts = callback.data.split(":")
+    issue_id = parts[1]
+    serial = parts[2]
+    user_id = int(parts[3])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
+        return
+    
+    # Проверка существующего несоответствия
+    has_defect = await check_existing_defect(issue_id, serial, user_id)
+    
+    if has_defect:
+        await callback.message.edit_text(
+            f"❌ Для оборудования {serial} уже зарегистрировано несоответствие!\n\n"
+            f"Проверьте чек-лист задачи #{issue_id}"
+        )
+        await state.clear()
+        return
+    
+    await callback.answer()
+    
+    # Сохраняем серийник
+    await state.update_data(serial=serial)
+    await state.set_state(DefectRegistration.waiting_for_cause)
+    
+    await callback.message.edit_text(
+        f"🔹 Задача: #{issue_id}\n"
+        f"🔹 S/N: {serial}\n"
+        f"📸 Фото: прикреплено\n\n"
+        f"Начните вводить причину несоответствия..."
+    )
+
+
+@dp.message(DefectRegistration.waiting_for_cause)
+async def defect_search_cause(message: types.Message, state: FSMContext):
+    """Пользователь ввёл текст поиска"""
+    query = message.text.strip()
+    
+    if not query:
+        await message.answer("Введите хотя бы несколько символов")
+        return
+    
+    # Поиск
+    results = search_defects(query, limit=10)
+    
+    if not results:
+        await message.answer(
+            f"❌ По запросу '{query}' ничего не найдено\n\n"
+            f"Попробуйте другие слова"
+        )
+        return
+    
+    # Показываем результаты
+    buttons = []
+    for defect in results:
+        buttons.append([InlineKeyboardButton(
+            text=f"{defect['code']} - {defect['description']}",
+            callback_data=f"defect_cause:{defect['code']}:{message.from_user.id}"
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="← Назад", 
+        callback_data=f"defect_back_serial:{message.from_user.id}"
+    )])
+    buttons.append([InlineKeyboardButton(
+        text="❌ Отменить",
+        callback_data=f"defect_cancel:{message.from_user.id}"
+    )])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await message.answer(
+        f"Найдено: {len(results)} шт.\n\n"
+        f"Выберите причину:",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("defect_cause:"))
+async def defect_select_cause_callback(callback: CallbackQuery, state: FSMContext):
+    """Пользователь выбрал причину"""
+    parts = callback.data.split(":")
+    code = parts[1]
+    user_id = int(parts[2])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
+        return
+    
+    # Находим описание
+    defect = next((d for d in DEFECTS if d["code"] == code), None)
+    if not defect:
+        await callback.answer("Ошибка: код не найден", show_alert=True)
+        return
+    
+    # Добавляем дефект в список
+    data = await state.get_data()
+    defects = data.get("defects", [])
+    defects.append({
+        "code": code,
+        "description": defect["description"]
+    })
+    await state.update_data(defects=defects)
+    
+    await callback.answer()
+    
+    # Спрашиваем: ещё дефекты?
+    buttons = [
+        [InlineKeyboardButton(
+            text="➕ Да, добавить ещё",
+            callback_data=f"defect_more:yes:{user_id}"
+        )],
+        [InlineKeyboardButton(
+            text="✅ Нет, создать подзадачу",
+            callback_data=f"defect_more:no:{user_id}"
+        )],
+        [InlineKeyboardButton(
+            text="❌ Отменить",
+            callback_data=f"defect_cancel:{user_id}"
+        )]
+    ]
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    photos_count = len(data.get("photos", []))
+    
+    await callback.message.edit_text(
+        f"✅ Несоответствие добавлено!\n\n"
+        f"🔹 S/N: {data['serial']}\n"
+        f"🔹 Причина: {defect['description']} ({code})\n"
+        f"📸 Фото: {photos_count} шт.\n\n"
+        f"Есть ещё несоответствия на этом оборудовании?",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("defect_more:"))
+async def defect_more_callback(callback: CallbackQuery, state: FSMContext):
+    """Добавить ещё или создать подзадачу"""
+    parts = callback.data.split(":")
+    choice = parts[1]
+    user_id = int(parts[2])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
+        return
+    
+    if choice == "yes":
+        # Добавить ещё дефект
+        await callback.answer()
+        await state.set_state(DefectRegistration.waiting_for_cause)
+        
+        data = await state.get_data()
+        await callback.message.edit_text(
+            f"🔹 S/N: {data['serial']}\n"
+            f"🔹 Дефектов: {len(data['defects'])} шт.\n\n"
+            f"Начните вводить следующую причину..."
+        )
+    
+    else:
+        # Создать подзадачу - показываем финальное подтверждение
+        await show_final_confirmation(callback.message, state, user_id)
+
+@dp.callback_query(lambda c: c.data.startswith("defect_confirm:"))
+async def defect_confirm_callback(callback: CallbackQuery, state: FSMContext):
+    """Финальное подтверждение"""
+    parts = callback.data.split(":")
+    action = parts[1]
+    user_id = int(parts[2])
+    
+    if callback.from_user.id != user_id:
+        await callback.answer("Эта кнопка не для тебя!", show_alert=True)
+        return
+    
+    if action == "edit":
+        # Вернуться к добавлению дефектов
+        await callback.answer()
+        await state.set_state(DefectRegistration.waiting_for_cause)
+        
+        data = await state.get_data()
+        await callback.message.edit_text(
+            f"🔹 S/N: {data['serial']}\n"
+            f"🔹 Дефектов: {len(data['defects'])} шт.\n\n"
+            f"Начните вводить причину..."
+        )
+    
+    elif action == "create":
+        # Создать подзадачу
+        await callback.answer("⏳ Создаю подзадачу...")
+        await create_defect_subtask(callback.message, state, user_id)
+        
+async def create_defect_subtask(message: types.Message, state: FSMContext, user_id: int):
+    """Создаёт подзадачу на устранение несоответствий и обновляет чек-листы"""
+    data = await state.get_data()
+    
+    issue_id = data["issue_id"]
+    serial = data["serial"]
+    defects = data["defects"]
+    photos = data["photos"]
+    equipment_info = data["equipment_info"]
+    deadline = data["deadline"]
+    
+    try:
+        headers = {
+            "X-Redmine-API-Key": get_user_api_token(user_id),
+            "Content-Type": "application/json"
+        }
+        
+        # ===== 1. ФОРМИРУЕМ ДАННЫЕ ПОДЗАДАЧИ =====
+        
+        # Название
+        subject = f"Устранение несоответствий {equipment_info['equipment_name']}"
+        
+        # Описание
+        defects_list = "\n".join([
+            f"{i+1}. {d['description']} ({d['code']})"
+            for i, d in enumerate(defects)
+        ])
+        description = f"Устранить несоответствия:\n{defects_list}"
+        
+        # Коды через запятую
+        defect_codes = ", ".join([d["code"] for d in defects])
+        
+        # Payload подзадачи
+        subtask_payload = {
+            "issue": {
+                "project_id": equipment_info["project_id"],
+                "parent_issue_id": int(issue_id),
+                "subject": subject,
+                "description": description,
+                "tracker_id": TRACKER_DEFECT_FIX,
+                "status_id": STATUS_NEW,
+                "priority_id": PRIORITY_HIGH,
+                "due_date": deadline,
+                "custom_fields": [
+                    {"id": FIELD_SERIAL_NUMBER, "value": serial},
+                    {"id": FIELD_DEFECT_CODE, "value": defect_codes},
+                    {"id": FIELD_CATEGORY, "value": equipment_info["category"]}
+                ]
+            }
+        }
+        
+        # Добавляем assigned_to если есть
+        if equipment_info.get("assigned_to_id"):
+            subtask_payload["issue"]["assigned_to_id"] = equipment_info["assigned_to_id"]
+        
+        # ===== 2. СОЗДАЁМ ПОДЗАДАЧУ =====
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{REDMINE_URL}/issues.json",
+                headers=headers,
+                json=subtask_payload,
+                ssl=False
+            ) as resp:
+                if resp.status not in (200, 201):
+                    error_text = await resp.text()
+                    logging.error(f"Ошибка создания подзадачи: {error_text}")
+                    await message.edit_text(f"❌ Ошибка создания подзадачи: HTTP {resp.status}")
+                    await state.clear()
+                    return
+                
+                subtask_data = await resp.json()
+                subtask_id = str(subtask_data["issue"]["id"])
+                logging.info(f"✅ Создана подзадача #{subtask_id}")
+        
+        # ===== 3. ЗАГРУЖАЕМ ФОТО В ЗАДАЧУ КОНТРОЛЯ =====
+        
+        for photo_id in photos:
+            try:
+                await upload_photo_to_redmine_by_id(issue_id, photo_id, user_id)
+            except Exception as e:
+                logging.error(f"Ошибка загрузки фото: {e}")
+        
+        # ===== 4. СОЗДАЁМ ЧЕК-ЛИСТ В ПОДЗАДАЧЕ =====
+        
+        await create_subtask_checklist(subtask_id, serial, defects, user_id)
+        
+        # ===== 5. ОБНОВЛЯЕМ ЧЕК-ЛИСТ ЗАДАЧИ КОНТРОЛЯ =====
+        
+        await update_control_task_checklist(issue_id, serial, subtask_id, user_id)
+        
+        # ===== 6. ПЕРЕСЧИТЫВАЕМ ПРОЦЕНТ ГОТОВНОСТИ =====
+        
+        await recalculate_done_ratio(issue_id, user_id)
+        
+        # ===== 7. ПОКАЗЫВАЕМ РЕЗУЛЬТАТ =====
+        
+        result_text = (
+            f"✅ Подзадача создана!\n\n"
+            f"🔹 #{subtask_id}: {subject}\n"
+            f"🔹 Назначена: {equipment_info.get('assigned_to_name', 'не назначен')}\n"
+            f"🔹 Срок: {deadline}\n"
+            f"🔹 Дефектов: {len(defects)} шт.\n"
+            f"📸 Фото: {len(photos)} шт. прикреплено к задаче контроля"
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Открыть подзадачу", url=f"{REDMINE_URL}/issues/{subtask_id}"),
+                InlineKeyboardButton(text="Задача контроля", url=f"{REDMINE_URL}/issues/{issue_id}")
+            ]
+        ])
+        
+        await message.edit_text(result_text, reply_markup=keyboard)
+        await state.clear()
+    
+    except Exception as e:
+        logging.error(f"Ошибка create_defect_subtask: {e}", exc_info=True)
+        await message.edit_text(f"❌ Ошибка при создании подзадачи: {e}")
+        await state.clear()
+        
+async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, user_id: int):
+    """
+    Создаёт чек-лист в подзадаче на устранение несоответствий.
+    
+    Структура:
+    - Заголовок: "Устранение несоответствий {serial} (отв. производство/Сборщик ПК)"
+    - "Переместить изделие на участок производства"
+    - "Исправить несоответствие: {описание}" (для каждого дефекта)
+    - "Провести проверку сборки и программного обеспечения"
+    - "Переместить продукцию на участок тестирования"
+    """
+    headers = {
+        "X-Redmine-API-Key": get_user_api_token(user_id),
+        "Content-Type": "application/xml"
+    }
+    
+    try:
+        checklist_items = []
+        position = 0
+        
+        # 1. Заголовок (с пробелом в начале)
+        header = CHECKLIST_SUBTASK_HEADER.format(serial=serial)
+        checklist_items.append({
+            "subject": header,
+            "is_done": "0",
+            "position": position
+        })
+        position += 1
+        
+        # 2. Переместить на участок производства
+        checklist_items.append({
+            "subject": CHECKLIST_SUBTASK_MOVE_TO_PROD,
+            "is_done": "0",
+            "position": position
+        })
+        position += 1
+        
+        # 3. Исправить несоответствия (для каждого дефекта)
+        for defect in defects:
+            checklist_items.append({
+                "subject": f"{CHECKLIST_SUBTASK_FIX_PREFIX}{defect['description']}",
+                "is_done": "0",
+                "position": position
+            })
+            position += 1
+        
+        # 4. Провести проверку
+        checklist_items.append({
+            "subject": CHECKLIST_SUBTASK_CHECK,
+            "is_done": "0",
+            "position": position
+        })
+        position += 1
+        
+        # 5. Переместить на тестирование
+        checklist_items.append({
+            "subject": CHECKLIST_SUBTASK_MOVE_TO_TEST,
+            "is_done": "0",
+            "position": position
+        })
+        
+        # Создаём все пункты
+        async with aiohttp.ClientSession() as session:
+            for item in checklist_items:
+                checklist_el = ET.Element("checklist")
+                ET.SubElement(checklist_el, "issue_id").text = subtask_id
+                ET.SubElement(checklist_el, "subject").text = item["subject"]
+                ET.SubElement(checklist_el, "is_done").text = item["is_done"]
+                ET.SubElement(checklist_el, "position").text = str(item["position"])
+                
+                payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
+                
+                async with session.post(
+                    f"{REDMINE_URL}/issues/{subtask_id}/checklists.xml",
+                    headers=headers,
+                    data=payload,
+                    ssl=False
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        logging.error(f"Ошибка создания пункта чек-листа: HTTP {resp.status}")
+        
+        logging.info(f"✅ Чек-лист создан для подзадачи #{subtask_id}")
+    
+    except Exception as e:
+        logging.error(f"Ошибка create_subtask_checklist: {e}")
+        
+async def update_control_task_checklist(issue_id: str, serial: str, subtask_id: str, user_id: int):
+    """
+    Обновляет чек-лист задачи контроля:
+    1. Отмечает пункты от "Визуальный осмотр" до "ПО видеонаблюдения"
+    2. Вставляет 4 новых пункта после "Нагрузочное тестирование"
+    3. Отмечает 2 из них сразу
+    """
+    headers = {
+        "X-Redmine-API-Key": get_user_api_token(user_id),
+        "Content-Type": "application/xml"
+    }
+    
+    try:
+        # Получаем чек-лист
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{issue_id}/checklists.xml",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Ошибка получения чек-листа: HTTP {resp.status}")
+                    return
+                xml_text = await resp.text()
+        
+        root = ET.fromstring(xml_text)
+        checklist_items = []
+        
+        for cl in root.findall("checklist"):
+            checklist_items.append({
+                "id": cl.findtext("id"),
+                "subject": (cl.findtext("subject") or "").strip(),
+                "is_done": cl.findtext("is_done") or "0",
+                "position": int(cl.findtext("position") or "0"),
+                "issue_id": cl.findtext("issue_id") or issue_id
+            })
+        
+        # ===== 1. НАЙТИ БЛОК СЕРИЙНИКА =====
+        
+        serial_idx = None
+        for idx, item in enumerate(checklist_items):
+            subj_l = item["subject"].lower()
+            if ("проверка оборудования" in subj_l and 
+                serial.upper() in item["subject"].upper() and
+                "указать" not in subj_l):
+                serial_idx = idx
+                break
+        
+        if serial_idx is None:
+            logging.error(f"Серийник {serial} не найден в чек-листе")
+            return
+        
+        # ===== 2. НАЙТИ ПОЗИЦИЮ ДЛЯ ВСТАВКИ =====
+        
+        insert_after_position = None
+        auto_check_until_position = None
+        
+        for idx in range(serial_idx + 1, len(checklist_items)):
+            item = checklist_items[idx]
+            subj_l = item["subject"].lower()
+            
+            # Конец блока (новый серийник)
+            if "проверка оборудования" in subj_l and serial.upper() not in item["subject"].upper():
+                break
+            
+            # Пункт для автоотметки (последний)
+            if "проверка настройки и лицензирования" in subj_l and "видеонаблюдения" in subj_l:
+                auto_check_until_position = item["position"]
+            
+            # Пункт после которого вставляем
+            if "проведение нагрузочного тестирования" in subj_l:
+                insert_after_position = item["position"]
+        
+        if insert_after_position is None:
+            logging.error("Не найден пункт 'Проведение нагрузочного тестирования'")
+            return
+        
+        # ===== 3. ОТМЕТИТЬ ПУНКТЫ ОТ НАЧАЛА ДО "ПО ВИДЕОНАБЛЮДЕНИЯ" =====
+        
+        if auto_check_until_position:
+            async with aiohttp.ClientSession() as session:
+                for idx in range(serial_idx + 1, len(checklist_items)):
+                    item = checklist_items[idx]
+                    
+                    # Пропускаем заголовки
+                    subj_l = item["subject"].lower()
+                    if ("проверка оборудования" in subj_l or
+                        "комплектация оборудования" in subj_l or
+                        "выдача готового" in subj_l):
+                        continue
+                    
+                    # Отмечаем до нужного пункта включительно
+                    if item["position"] <= auto_check_until_position:
+                        if item["is_done"] not in ("1", "true"):
+                            await mark_checklist_item(item["id"], item["issue_id"], item["subject"], user_id)
+                    else:
+                        break
+        
+        # ===== 4. ВСТАВИТЬ 4 НОВЫХ ПУНКТА =====
+        
+        new_items = [
+            {
+                "subject": CHECKLIST_DEFECT_HEADER,  # С пробелом в начале - заголовок
+                "is_done": "0",
+                "position": insert_after_position + 1
+            },
+            {
+                "subject": CHECKLIST_DEFECT_PHOTO,
+                "is_done": "1",  # Отмечаем сразу
+                "position": insert_after_position + 2
+            },
+            {
+                "subject": CHECKLIST_DEFECT_SUBTASK,
+                "is_done": "1",  # Отмечаем сразу
+                "position": insert_after_position + 3
+            },
+            {
+                "subject": CHECKLIST_DEFECT_RECHECK,
+                "is_done": "0",
+                "position": insert_after_position + 4
+            }
+        ]
+        
+        async with aiohttp.ClientSession() as session:
+            for new_item in new_items:
+                checklist_el = ET.Element("checklist")
+                ET.SubElement(checklist_el, "issue_id").text = issue_id
+                ET.SubElement(checklist_el, "subject").text = new_item["subject"]
+                ET.SubElement(checklist_el, "is_done").text = new_item["is_done"]
+                ET.SubElement(checklist_el, "position").text = str(new_item["position"])
+                
+                payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
+                
+                async with session.post(
+                    f"{REDMINE_URL}/issues/{issue_id}/checklists.xml",
+                    headers=headers,
+                    data=payload,
+                    ssl=False
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        logging.error(f"Ошибка вставки пункта: HTTP {resp.status}")
+        
+        logging.info(f"✅ Чек-лист задачи контроля #{issue_id} обновлён")
+    
+    except Exception as e:
+        logging.error(f"Ошибка update_control_task_checklist: {e}")
+
+
+async def mark_checklist_item(item_id: str, issue_id: str, subject: str, user_id: int):
+    """Отмечает один пункт чек-листа"""
+    headers = {
+        "X-Redmine-API-Key": get_user_api_token(user_id),
+        "Content-Type": "application/xml"
+    }
+    
+    try:
+        checklist_el = ET.Element("checklist")
+        ET.SubElement(checklist_el, "id").text = item_id
+        ET.SubElement(checklist_el, "issue_id").text = issue_id
+        ET.SubElement(checklist_el, "subject").text = subject
+        ET.SubElement(checklist_el, "is_done").text = "1"
+        
+        payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                f"{REDMINE_URL}/checklists/{item_id}.xml",
+                headers=headers,
+                data=payload,
+                ssl=False
+            ) as resp:
+                if resp.status not in (200, 201, 422):
+                    logging.error(f"Ошибка отметки пункта: HTTP {resp.status}")
+    
+    except Exception as e:
+        logging.error(f"Ошибка mark_checklist_item: {e}")
+        
+async def upload_photo_to_redmine_by_id(issue_id: str, file_id: str, user_id: int):
+    """Загружает фото в Redmine по file_id из Telegram"""
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    
+    try:
+        # Скачиваем файл из Telegram
+        file = await bot.get_file(file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file.file_path}"
+        filename = file.file_path.split("/")[-1]
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url, ssl=False) as resp:
+                photo_data = await resp.read()
+            
+            # Загружаем в Redmine
+            upload_url = f"{REDMINE_URL}/uploads.json"
+            async with session.post(
+                upload_url,
+                headers={**headers, "Content-Type": "application/octet-stream"},
+                data=photo_data,
+                ssl=False
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logging.error(f"Ошибка загрузки файла: HTTP {resp.status}")
+                    return
+                upload_info = await resp.json()
+                token = upload_info["upload"]["token"]
+            
+            # Прикрепляем к задаче
+            payload = {
+                "issue": {
+                    "uploads": [{"token": token, "filename": filename, "content_type": "image/jpeg"}]
+                }
+            }
+            
+            async with session.put(
+                f"{REDMINE_URL}/issues/{issue_id}.json",
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+                ssl=False
+            ) as resp:
+                if resp.status in (200, 204):
+                    logging.info(f"✅ Фото прикреплено к задаче #{issue_id}")
+    
+    except Exception as e:
+        logging.error(f"Ошибка upload_photo_to_redmine_by_id: {e}")
+
+async def show_final_confirmation(message: types.Message, state: FSMContext, user_id: int):
+    """Показывает финальное подтверждение перед созданием подзадачи"""
+    data = await state.get_data()
+    
+    issue_id = data["issue_id"]
+    serial = data["serial"]
+    defects = data["defects"]
+    photos = data["photos"]
+    
+    # Получаем название оборудования
+    equipment_info = await find_equipment_name(issue_id, serial, user_id)
+    
+    if not equipment_info:
+        await message.edit_text(
+            f"❌ Ошибка: не найдена задача производства для S/N {serial}\n\n"
+            f"Проверьте что серийник указан в задаче производства"
+        )
+        await state.clear()
+        return
+    
+    # Формируем список дефектов
+    defects_list = "\n".join([
+        f"   {i+1}. {d['description']} ({d['code']})"
+        for i, d in enumerate(defects)
+    ])
+    
+    # Дедлайн
+    deadline = calculate_deadline()
+    
+    # Сохраняем equipment_info
+    await state.update_data(equipment_info=equipment_info, deadline=deadline)
+    await state.set_state(DefectRegistration.confirming)
+    
+    buttons = [
+        [InlineKeyboardButton(text="✅ Создать", callback_data=f"defect_confirm:create:{user_id}")],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"defect_confirm:edit:{user_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"defect_cancel:{user_id}")]
+    ]
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    await message.edit_text(
+        f"📋 Создать подзадачу на устранение несоответствий?\n\n"
+        f"🔹 Задача: #{issue_id}\n"
+        f"🔹 S/N: {serial}\n"
+        f"🔹 Оборудование: {equipment_info['equipment_name']}\n"
+        f"🔹 Несоответствий: {len(defects)} шт.\n"
+        f"{defects_list}\n"
+        f"📸 Фото: {len(photos)} шт.\n"
+        f"🔹 Назначена: {equipment_info.get('assigned_to_name', 'не назначен')}\n"
+        f"🔹 Срок: {deadline}\n",
+        reply_markup=keyboard
+    )
 
 # ===================== ЗАПУСК БОТА =====================
 
