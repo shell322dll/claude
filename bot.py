@@ -28,6 +28,7 @@ from config import (
     # Новые константы для несоответствий:
     FIELD_SERIAL_NUMBER,
     FIELD_DEFECT_CODE,
+    FIELD_DEFECT_COUNT,
     FIELD_CATEGORY,
     TRACKER_DEFECT_FIX,
     STATUS_NEW,
@@ -351,38 +352,21 @@ async def check_task_for_serial(task_data: dict, task_id: str, serial: str, user
         
         logging.info(f"[CHECK] ✅ СОВПАДЕНИЕ! Нашли задачу #{task_id}")
         
-        # Извлекаем название
+        import re
+
         subject = task_data["issue"]["subject"]
         logging.info(f"[CHECK] Название задачи: {subject}")
-        
-        import re
-        match = re.search(r'\(([^()]+)\)\s*$', subject)
-        if match:
-            equipment_full = match.group(1)
-            logging.info(f"[CHECK] Извлечено (вариант без вложенных скобок): '{equipment_full}'")
-        else:
-            logging.error(f"[CHECK] Не удалось извлечь название оборудования из '{subject}'")
-            return None
-        
-        # Вариант 1: С вложенными скобками (Видеосервер RV-SE3700 (Сборка 26309) - 1 шт.)
-        match = re.search(r'\(([^(]+\([^)]+\)[^)]*)\)\s*$', subject)
+
+        # Универсальное регулярное выражение для извлечения содержимого последних скобок
+        # с учётом возможных вложенных скобок
+        match = re.search(r'\(([^()]*(?:\([^()]*\)[^()]*)*)\)\s*$', subject)
 
         if match:
             equipment_full = match.group(1)
-            logging.info(f"[CHECK] Извлечено (вариант с вложенными скобками): '{equipment_full}'")
+            logging.info(f"[CHECK] Извлечено: '{equipment_full}'")
         else:
-            # Вариант 2: Без вложенных скобок (Персональный компьютер для Борисова В.В. - 1 шт.)
-            match = re.search(r'\(([^()]+)\)\s*$', subject)
-            
-            if match:
-                equipment_full = match.group(1)
-                logging.info(f"[CHECK] Извлечено (вариант без вложенных скобок): '{equipment_full}'")
-            else:
-                logging.error(f"[CHECK] Не удалось извлечь название оборудования из '{subject}'")
-                return None
-        
-        equipment_full = match.group(1)
-        logging.info(f"[CHECK] Извлечено: '{equipment_full}'")
+            logging.error(f"[CHECK] Не удалось извлечь название оборудования из '{subject}'")
+            return None
         
         # Заменяем количество на "- 1 шт."
         equipment_name = re.sub(r'-\s*\d+\s*шт\.', '- 1 шт.', equipment_full)
@@ -1826,7 +1810,7 @@ async def complete_check_callback(callback: CallbackQuery):
             logging.info(f"Уведомление отправлено Сергею Пожарову о задаче #{issue_id}")
             
             # ИЗМЕНИ ЭТУ СТРОКУ - используй user_id вместо callback.from_user.id:
-            await bot.send_message(user_id, f"📬 Уведомление о возможности комплектации {serial} отправлено!")
+            await bot.send_message(user_id, f"📬 Уведомление об упаковке {serial} и перемещении на склад отправлено!")
             
         except Exception as e:
             logging.error(f"Не удалось отправить уведомление Сергею Пожарову: {e}")
@@ -1952,6 +1936,7 @@ async def mark_remaining_checklist_items(issue_id: str, serial: str, user_id: in
         "упаковка оборудования",
         "контроль упаковки оборудования",
         "перемещение готового оборудования на склад",
+        "повторный технический контроль"
     ]
     
     try:
@@ -2697,7 +2682,7 @@ async def confirm_final_photo_callback(callback: CallbackQuery, state: FSMContex
             
             await bot.send_message(
                 chat_id=POZHAROV_USER_ID,
-                text=f"Задача контроля #{control_task_id}\n🔹 S/N: {serial} упаковано и перемещается на склад.",
+                text=f"🔹 Задача контроля #{control_task_id}\n📦 {serial} упаковано и перемещается на склад.",
                 reply_markup=notification_keyboard
             )
             logging.info(f"✅ Уведомление Сергею отправлено! Теперь отправляю пользователю {user_id}")
@@ -2915,25 +2900,49 @@ async def mark_checklist_item_callback(callback: CallbackQuery):
     await callback.answer("⏳ Отмечаю пункты...")
     
     try:
-        # Определяем целевой пункт (ИСПРАВЛЕНО!)
+        # Определяем целевой пункт
         if target == "photo_po":
             item_name = "Проверка настройки и лицензирования ПО видеонаблюдения"
         else:  # testing
             item_name = "Проведение нагрузочного тестирования"
         
-        # Отмечаем пункты (передаём target напрямую: "photo_po" или "testing")
+        # Отмечаем пункты
         marked_count = await mark_items_up_to_target(issue_id, serial, target, user_id)
         
         # Удаляем меню с кнопками
         await callback.message.delete()
         
-        # Отправляем ОДНО сообщение (убрали дублирование)
+        # Отправляем сообщение пользователю
         await bot.send_message(
             callback.from_user.id,
             f"📋 Отмечен пункт чек-листа: {item_name} (S/N: {serial})"
         )
         
         logging.info(f"Отмечено {marked_count} пунктов для S/N {serial} в задаче #{issue_id}")
+        
+        # ===== ОТПРАВКА УВЕДОМЛЕНИЯ ТОЛЬКО ДЛЯ "ПО ВИДЕОНАБЛЮДЕНИЯ" =====
+        # # # if target == "photo_po":
+            # # # try:
+                # # # notification_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    # # # [InlineKeyboardButton(text=f"Задача #{issue_id}", url=f"{REDMINE_URL}/issues/{issue_id}")]
+                # # # ])
+                
+                # # # await bot.send_message(
+                    # # # chat_id=POZHAROV_USER_ID,
+                    # # # text=f"🔹 Задача контроля #{control_task_id}\n⚙️ {serial} выполнена функциональная проверка оборудования.",
+                    # # # reply_markup=notification_keyboard
+                # # # )
+                
+                # # # logging.info(f"Уведомление о функциональной проверке отправлено Сергею Пожарову о задаче #{issue_id}")
+                
+                # # # # Уведомляем пользователя что уведомление отправлено
+                # # # await bot.send_message(
+                    # # # user_id, 
+                    # # # f"📬 Уведомление о функциональной проверке {serial} отправлено!"
+                # # # )
+                
+            # # # except Exception as e:
+                # # # logging.error(f"Не удалось отправить уведомление Сергею Пожарову: {e}")
         
         # Очищаем блокировку
         user_processing.pop(user_id, None)
@@ -3449,13 +3458,17 @@ async def create_defect_subtask(message: types.Message, state: FSMContext, user_
         
         # ===== 5. ОБНОВЛЯЕМ ЧЕК-ЛИСТ ЗАДАЧИ КОНТРОЛЯ =====
         
-        await update_control_task_checklist(issue_id, serial, subtask_id, user_id)
+        await update_control_task_checklist_with_defect(issue_id, serial, subtask_id, user_id)
         
-        # ===== 6. ПЕРЕСЧИТЫВАЕМ ПРОЦЕНТ ГОТОВНОСТИ =====
+        # ===== 6. ОБНОВЛЯЕМ ПОЛЯ ЗАДАЧИ КОНТРОЛЯ =====
+        
+        await update_control_task_defect_fields(issue_id, defect_codes, user_id)
+        
+        # ===== 7. ПЕРЕСЧИТЫВАЕМ ПРОЦЕНТ ГОТОВНОСТИ =====
         
         await recalculate_done_ratio(issue_id, user_id)
         
-        # ===== 7. ПОКАЗЫВАЕМ РЕЗУЛЬТАТ =====
+        # ===== 8. ПОКАЗЫВАЕМ РЕЗУЛЬТАТ =====
         
         result_text = (
             f"✅ Подзадача создана!\n\n"
@@ -3480,18 +3493,291 @@ async def create_defect_subtask(message: types.Message, state: FSMContext, user_
         logging.error(f"Ошибка create_defect_subtask: {e}", exc_info=True)
         await message.edit_text(f"❌ Ошибка при создании подзадачи: {e}")
         await state.clear()
+
+async def update_control_task_checklist_with_defect(issue_id: str, serial: str, subtask_id: str, user_id: int):
+    """
+    Обновляет чек-лист задачи контроля: добавляет блок 'Изолятор брака'
+    МЕТОД: Пересоздаём весь чек-лист с правильным порядком
+    """
+    try:
+        logging.info(f"[CONTROL_CHECKLIST] === СТАРТ ===")
         
-async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, user_id: int):
+        headers = {
+            "X-Redmine-API-Key": get_user_api_token(user_id),
+            "Content-Type": "application/xml"
+        }
+        
+        # ===== ФУНКЦИЯ ОПРЕДЕЛЕНИЯ СЕКЦИЙ =====
+        
+        def is_section_by_subject(subject: str) -> bool:
+            """Определяет, является ли элемент секцией по названию"""
+            subject_lower = subject.lower().strip()
+            
+            # Список ключевых фраз для секций
+            section_keywords = [
+                "проверка оборудования",
+                "переместить изделие в изолятор",
+                "комплектация оборудования",
+                "выдача готового оборудования"
+            ]
+            
+            # Проверяем наличие ключевых слов
+            for keyword in section_keywords:
+                if keyword in subject_lower:
+                    return True
+            
+            # Дополнительная проверка: если текст начинается с пробела — это секция
+            if subject.startswith(" ") and not subject.strip().startswith("Визуальный"):
+                return True
+            
+            return False
+        
+        # ===== 1. ПОЛУЧАЕМ ВЕСЬ ЧЕК-ЛИСТ =====
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{issue_id}/checklists.xml",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"[CONTROL_CHECKLIST] Ошибка: HTTP {resp.status}")
+                    return
+                xml_text = await resp.text()
+        
+        root = ET.fromstring(xml_text)
+        checklist_items = []
+        
+        for cl in root.findall("checklist"):
+            subject = (cl.findtext("subject") or "").strip()
+            is_done_text = cl.findtext("is_done")
+            is_section_text = cl.findtext("is_section")
+            
+            # Определяем is_section: берём из XML или определяем по названию
+            if is_section_text == "true":
+                is_section = True
+            elif is_section_text == "false":
+                is_section = False
+            else:
+                # Если в XML нет поля is_section, определяем сами
+                is_section = is_section_by_subject(subject)
+            
+            checklist_items.append({
+                "id": cl.findtext("id"),
+                "subject": subject,
+                "is_done": is_done_text == "true",
+                "is_section": is_section,
+                "position": int(cl.findtext("position") or "0"),
+            })
+        
+        # Сортируем по позиции
+        checklist_items.sort(key=lambda x: x["position"])
+        
+        logging.info(f"[CONTROL_CHECKLIST] Получено {len(checklist_items)} элементов")
+        
+        # Логируем секции для отладки
+        sections_count = sum(1 for item in checklist_items if item["is_section"])
+        logging.info(f"[CONTROL_CHECKLIST] Найдено {sections_count} секций")
+        
+        # ===== 2. ИЩЕМ БЛОК СЕРИЙНИКА =====
+        
+        serial_block_start = None
+        insert_after_idx = None
+        
+        for i, item in enumerate(checklist_items):
+            subj = item["subject"]
+            
+            # Начало блока
+            if serial.upper() in subj.upper() and "проверка оборудования" in subj.lower():
+                serial_block_start = i
+                logging.info(f"[CONTROL_CHECKLIST] Блок серийника начинается с индекса {i}")
+            
+            # Пункт "Нагрузочное тестирование" в этом блоке
+            if serial_block_start is not None and "нагрузочн" in subj.lower() and "тестирован" in subj.lower():
+                insert_after_idx = i
+                logging.info(f"[CONTROL_CHECKLIST] 'Нагрузочное тестирование' на индексе {i}")
+                break
+        
+        if insert_after_idx is None:
+            logging.error(f"[CONTROL_CHECKLIST] Не найдено место для вставки")
+            return
+        
+        # ===== 3. ПРОВЕРЯЕМ, ЕСТЬ ЛИ УЖЕ "ИЗОЛЯТОР БРАКА" =====
+        
+        for item in checklist_items:
+            if "изолятор брака" in item["subject"].lower():
+                logging.info(f"[CONTROL_CHECKLIST] 'Изолятор брака' уже есть")
+                return
+        
+        # ===== 4. ВСТАВЛЯЕМ 4 НОВЫХ ЭЛЕМЕНТА В СПИСОК =====
+        
+        new_items = [
+            {
+                "id": None,  # Новый элемент
+                "subject": CHECKLIST_DEFECT_HEADER,
+                "is_done": False,
+                "is_section": True,  # СЕКЦИЯ!
+                "position": 0
+            },
+            {
+                "id": None,
+                "subject": CHECKLIST_DEFECT_PHOTO,
+                "is_done": True,
+                "is_section": False,
+                "position": 0
+            },
+            {
+                "id": None,
+                "subject": CHECKLIST_DEFECT_SUBTASK,
+                "is_done": True,
+                "is_section": False,
+                "position": 0
+            },
+            {
+                "id": None,
+                "subject": CHECKLIST_DEFECT_RECHECK,
+                "is_done": False,
+                "is_section": False,
+                "position": 0
+            }
+        ]
+        
+        # Вставляем ПОСЛЕ "Нагрузочное тестирование"
+        for i, new_item in enumerate(new_items):
+            checklist_items.insert(insert_after_idx + 1 + i, new_item)
+        
+        logging.info(f"[CONTROL_CHECKLIST] Теперь {len(checklist_items)} элементов (добавлено 4)")
+        
+        # ===== 5. УДАЛЯЕМ ВСЕ СТАРЫЕ ЭЛЕМЕНТЫ =====
+        
+        logging.info(f"[CONTROL_CHECKLIST] Удаляем старые элементы...")
+        
+        old_ids = [item["id"] for item in checklist_items if item["id"] is not None]
+        
+        async with aiohttp.ClientSession() as session:
+            for old_id in old_ids:
+                async with session.delete(
+                    f"{REDMINE_URL}/checklists/{old_id}.xml",
+                    headers=headers,
+                    ssl=False
+                ) as resp:
+                    if resp.status not in (200, 204):
+                        logging.warning(f"[CONTROL_CHECKLIST] Не удалось удалить ID={old_id}")
+        
+        logging.info(f"[CONTROL_CHECKLIST] Старые элементы удалены")
+        
+        # ===== 6. СОЗДАЁМ ЗАНОВО ВСЕ ЭЛЕМЕНТЫ С ПОЗИЦИЯМИ 0, 1, 2, 3... =====
+        
+        logging.info(f"[CONTROL_CHECKLIST] Создаём новый чек-лист...")
+        
+        async with aiohttp.ClientSession() as session:
+            for position, item in enumerate(checklist_items):
+                # Дополнительная проверка is_section при создании
+                is_section_final = item["is_section"] or is_section_by_subject(item["subject"])
+                
+                section_mark = " [СЕКЦИЯ]" if is_section_final else ""
+                logging.debug(f"[CONTROL_CHECKLIST] pos={position}: {item['subject'][:40]}{section_mark}")
+                
+                checklist_el = ET.Element("checklist")
+                ET.SubElement(checklist_el, "issue_id").text = str(issue_id)
+                ET.SubElement(checklist_el, "subject").text = item["subject"]
+                ET.SubElement(checklist_el, "is_done").text = "1" if item["is_done"] else "0"
+                ET.SubElement(checklist_el, "is_section").text = "1" if is_section_final else "0"
+                ET.SubElement(checklist_el, "position").text = str(position)
+                
+                payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
+                
+                async with session.post(
+                    f"{REDMINE_URL}/issues/{issue_id}/checklists.xml",
+                    headers=headers,
+                    data=payload,
+                    ssl=False
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        resp_text = await resp.text()
+                        logging.error(f"[CONTROL_CHECKLIST] Ошибка создания pos={position}: {resp_text[:100]}")
+        
+        logging.info(f"[CONTROL_CHECKLIST] ✅ === ГОТОВО: чек-лист пересоздан с секциями ===")
+        
+    except Exception as e:
+        logging.error(f"[CONTROL_CHECKLIST] ❌ Ошибка: {e}", exc_info=True)
+
+async def update_control_task_defect_fields(issue_id: str, new_defect_codes: str, user_id: int):
     """
-    Создаёт чек-лист в подзадаче на устранение несоответствий.
+        Обновляет поля задачи контроля:
+    - Увеличивает "К-во несоответствующей прод-и:" на 1
+    - Добавляет новые коды к "Код несоответствия:"
+    """
+    try:
+        headers = {
+            "X-Redmine-API-Key": get_user_api_token(user_id),
+            "Content-Type": "application/json"
+        }
+        
+        # Получаем текущие данные задачи
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{REDMINE_URL}/issues/{issue_id}.json",
+                headers=headers,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    logging.error(f"Не удалось получить данные задачи {issue_id}")
+                    return
+                
+                issue_data = await resp.json()
+                custom_fields = issue_data.get("issue", {}).get("custom_fields", [])
+        
+        # Ищем нужные поля
+        current_count = 0
+        current_codes = ""
+        
+        for field in custom_fields:
+            if field["id"] == FIELD_DEFECT_COUNT:  # ID: 152
+                current_count = int(field.get("value", 0) or 0)
+            elif field["id"] == FIELD_DEFECT_CODE:  # ID: 153
+                current_codes = field.get("value", "") or ""
+        
+        # Увеличиваем количество на 1
+        new_count = current_count + 1
+        
+        # Добавляем новые коды к существующим
+        if current_codes:
+            existing_codes_set = set(code.strip() for code in current_codes.split(","))
+            new_codes_set = set(code.strip() for code in new_defect_codes.split(","))
+            combined_codes = existing_codes_set.union(new_codes_set)
+            updated_codes = ", ".join(sorted(combined_codes))
+        else:
+            updated_codes = new_defect_codes
+        
+        # Обновляем задачу
+        update_payload = {
+            "issue": {
+                "custom_fields": [
+                    {"id": FIELD_DEFECT_COUNT, "value": str(new_count)},
+                    {"id": FIELD_DEFECT_CODE, "value": updated_codes}
+                ]
+            }
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.put(
+                f"{REDMINE_URL}/issues/{issue_id}.json",
+                headers=headers,
+                json=update_payload,
+                ssl=False
+            ) as resp:
+                if resp.status in (200, 204):
+                    logging.info(f"✅ Обновлены поля дефектов в задаче {issue_id}: кол-во={new_count}, коды={updated_codes}")
+                else:
+                    error_text = await resp.text()
+                    logging.error(f"Ошибка обновления полей дефектов: {error_text}")
     
-    Структура:
-    - Заголовок: "Устранение несоответствий {serial} (отв. производство/Сборщик ПК)"
-    - "Переместить изделие на участок производства"
-    - "Исправить несоответствие: {описание}" (для каждого дефекта)
-    - "Провести проверку сборки и программного обеспечения"
-    - "Переместить продукцию на участок тестирования"
-    """
+    except Exception as e:
+        logging.error(f"Ошибка update_control_task_defect_fields: {e}", exc_info=True)
+
+async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, user_id: int):
+    """Создаёт чек-лист в подзадаче на устранение несоответствий"""
     headers = {
         "X-Redmine-API-Key": get_user_api_token(user_id),
         "Content-Type": "application/xml"
@@ -3501,11 +3787,12 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
         checklist_items = []
         position = 0
         
-        # 1. Заголовок (с пробелом в начале)
+        # 1. Заголовок (СЕКЦИЯ!)
         header = CHECKLIST_SUBTASK_HEADER.format(serial=serial)
         checklist_items.append({
             "subject": header,
-            "is_done": "0",
+            "is_section": "1",  # Изменили True на "1" для XML
+            "is_done": "0",     # Добавили is_done
             "position": position
         })
         position += 1
@@ -3513,6 +3800,7 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
         # 2. Переместить на участок производства
         checklist_items.append({
             "subject": CHECKLIST_SUBTASK_MOVE_TO_PROD,
+            "is_section": "0",  # Добавили - обычный пункт
             "is_done": "0",
             "position": position
         })
@@ -3522,6 +3810,7 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
         for defect in defects:
             checklist_items.append({
                 "subject": f"{CHECKLIST_SUBTASK_FIX_PREFIX}{defect['description']}",
+                "is_section": "0",  # Добавили - обычный пункт
                 "is_done": "0",
                 "position": position
             })
@@ -3530,6 +3819,7 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
         # 4. Провести проверку
         checklist_items.append({
             "subject": CHECKLIST_SUBTASK_CHECK,
+            "is_section": "0",  # Добавили - обычный пункт
             "is_done": "0",
             "position": position
         })
@@ -3538,20 +3828,32 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
         # 5. Переместить на тестирование
         checklist_items.append({
             "subject": CHECKLIST_SUBTASK_MOVE_TO_TEST,
+            "is_section": "0",  # Добавили - обычный пункт
             "is_done": "0",
             "position": position
         })
         
+        # ДОБАВИМ ЛОГИРОВАНИЕ ПЕРЕД СОЗДАНИЕМ
+        logging.info(f"[CHECKLIST] Создаю чек-лист для подзадачи #{subtask_id}")
+        logging.info(f"[CHECKLIST] Количество пунктов: {len(checklist_items)}")
+        
         # Создаём все пункты
         async with aiohttp.ClientSession() as session:
-            for item in checklist_items:
+            for idx, item in enumerate(checklist_items):
+                is_section_label = "СЕКЦИЯ" if item.get("is_section") == "1" else "пункт"
+                logging.info(f"[CHECKLIST] Создаю {is_section_label} {idx+1}/{len(checklist_items)}: {item['subject'][:50]}...")
+                
                 checklist_el = ET.Element("checklist")
                 ET.SubElement(checklist_el, "issue_id").text = subtask_id
                 ET.SubElement(checklist_el, "subject").text = item["subject"]
                 ET.SubElement(checklist_el, "is_done").text = item["is_done"]
+                ET.SubElement(checklist_el, "is_section").text = item.get("is_section", "0")  # ДОБАВИЛИ ЭТО ПОЛЕ!
                 ET.SubElement(checklist_el, "position").text = str(item["position"])
                 
                 payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
+                
+                # ЛОГИРУЕМ PAYLOAD
+                logging.info(f"[CHECKLIST] XML payload: {payload.decode('utf-8')}")
                 
                 async with session.post(
                     f"{REDMINE_URL}/issues/{subtask_id}/checklists.xml",
@@ -3559,14 +3861,67 @@ async def create_subtask_checklist(subtask_id: str, serial: str, defects: list, 
                     data=payload,
                     ssl=False
                 ) as resp:
-                    if resp.status not in (200, 201):
-                        logging.error(f"Ошибка создания пункта чек-листа: HTTP {resp.status}")
+                    status = resp.status
+                    response_text = await resp.text()
+                    
+                    # ЛОГИРУЕМ ОТВЕТ
+                    logging.info(f"[CHECKLIST] HTTP {status}")
+                    
+                    if status not in (200, 201):
+                        logging.error(f"[CHECKLIST] Ошибка создания пункта чек-листа!")
+                        logging.error(f"[CHECKLIST] HTTP статус: {status}")
+                        logging.error(f"[CHECKLIST] Ответ сервера: {response_text[:500]}")
+                    else:
+                        logging.info(f"[CHECKLIST] ✅ Пункт создан успешно")
         
         logging.info(f"✅ Чек-лист создан для подзадачи #{subtask_id}")
     
     except Exception as e:
-        logging.error(f"Ошибка create_subtask_checklist: {e}")
+        logging.error(f"Ошибка create_subtask_checklist: {e}", exc_info=True)
+
+async def test_checklist_api(issue_id: str, user_id: int):
+    """Тестирует доступность API чек-листов"""
+    headers = {"X-Redmine-API-Key": get_user_api_token(user_id)}
+    
+    try:
+        # Попробуем получить существующие чек-листы
+        url = f"{REDMINE_URL}/issues/{issue_id}/checklists.xml"
         
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, ssl=False) as resp:
+                status = resp.status
+                text = await resp.text()
+                
+                logging.info(f"[TEST] GET checklists - HTTP {status}")
+                logging.info(f"[TEST] Response: {text[:500]}")
+                
+                if status == 404:
+                    logging.error("[TEST] ❌ API чек-листов недоступен (404)! Возможно плагин не установлен.")
+                    return False
+                
+                return True
+    
+    except Exception as e:
+        logging.error(f"[TEST] Ошибка тестирования API: {e}")
+        return False
+
+# Добавь команду для теста
+@dp.message(Command("test_checklist"))
+async def test_checklist_command(message: types.Message):
+    """Тестовая команда для проверки API чек-листов"""
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("Использование: /test_checklist <номер_задачи>")
+        return
+    
+    issue_id = args[1]
+    result = await test_checklist_api(issue_id, message.from_user.id)
+    
+    if result:
+        await message.answer(f"✅ API чек-листов доступен для задачи #{issue_id}")
+    else:
+        await message.answer(f"❌ API чек-листов недоступен!")
+
 async def update_control_task_checklist(issue_id: str, serial: str, subtask_id: str, user_id: int):
     """
     Обновляет чек-лист задачи контроля:
@@ -3669,23 +4024,27 @@ async def update_control_task_checklist(issue_id: str, serial: str, subtask_id: 
         
         new_items = [
             {
-                "subject": CHECKLIST_DEFECT_HEADER,  # С пробелом в начале - заголовок
+                "subject": CHECKLIST_DEFECT_HEADER,
                 "is_done": "0",
+                "is_section": "1",  # ЭТО КЛЮЧЕВОЕ ПОЛЕ - делает элемент секцией!
                 "position": insert_after_position + 1
             },
             {
                 "subject": CHECKLIST_DEFECT_PHOTO,
                 "is_done": "1",  # Отмечаем сразу
+                "is_section": "0",  # Обычный пункт
                 "position": insert_after_position + 2
             },
             {
                 "subject": CHECKLIST_DEFECT_SUBTASK,
                 "is_done": "1",  # Отмечаем сразу
+                "is_section": "0",  # Обычный пункт
                 "position": insert_after_position + 3
             },
             {
                 "subject": CHECKLIST_DEFECT_RECHECK,
                 "is_done": "0",
+                "is_section": "0",  # Обычный пункт
                 "position": insert_after_position + 4
             }
         ]
@@ -3696,6 +4055,7 @@ async def update_control_task_checklist(issue_id: str, serial: str, subtask_id: 
                 ET.SubElement(checklist_el, "issue_id").text = issue_id
                 ET.SubElement(checklist_el, "subject").text = new_item["subject"]
                 ET.SubElement(checklist_el, "is_done").text = new_item["is_done"]
+                ET.SubElement(checklist_el, "is_section").text = new_item["is_section"]  # ДОБАВИЛИ ЭТО ПОЛЕ
                 ET.SubElement(checklist_el, "position").text = str(new_item["position"])
                 
                 payload = ET.tostring(checklist_el, encoding="utf-8", method="xml")
@@ -3707,13 +4067,14 @@ async def update_control_task_checklist(issue_id: str, serial: str, subtask_id: 
                     ssl=False
                 ) as resp:
                     if resp.status not in (200, 201):
-                        logging.error(f"Ошибка вставки пункта: HTTP {resp.status}")
+                        error_text = await resp.text()
+                        logging.error(f"Ошибка вставки пункта '{new_item['subject']}': HTTP {resp.status}")
+                        logging.error(f"Ответ сервера: {error_text}")
         
         logging.info(f"✅ Чек-лист задачи контроля #{issue_id} обновлён")
     
     except Exception as e:
-        logging.error(f"Ошибка update_control_task_checklist: {e}")
-
+        logging.error(f"Ошибка update_control_task_checklist: {e}", exc_info=True)
 
 async def mark_checklist_item(item_id: str, issue_id: str, subject: str, user_id: int):
     """Отмечает один пункт чек-листа"""
